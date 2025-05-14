@@ -1,0 +1,306 @@
+---
+title: "xlsx-to-json-ld"
+author: "Robin Tim Biermann"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Introduction
+This markdown document shall help researchers to compile simple JSON-LD files from legacy data stored as .xlsx file to enhance FAIRness of small datasets. Since the knitting of the JSON-LD files will be semi-automatic, three inputs are required. 
+ 1. Actual dataset, where each colmn represents a feature
+ 2. A table that links columnames from the input data table to the suitable ontologies. Here users have to indicate the relationship between the ontologies in a hierachical manner. 
+ 3. A table that defines the origin of the used ontologies, which will later be used to compoese the references in the JSON-LD file.
+ 
+ Please review the descriptions provided in the README.md and the input_TEST.xlsx.
+
+# Libraries
+```{r}
+# install.packages(c("readxl", "jsonlite", "lubridate", "dplyr")) # Run once if needed
+library(readxl)
+library(jsonlite)
+library(lubridate)
+library(dplyr)     
+```
+
+# Configuration
+```{r}
+# Specify the file location and sheet names and update if needed
+EXCEL_FILE <- "./input_TEST.xlsx"
+MEASUREMENTS_SHEET <- "measurements"
+METADATA_SHEET <- "entity_metadata"
+ONTOLOGY_MAP_SHEET <- "ontology_map"
+OUTPUT_JSONLD_FILE <- "output_final.jsonld"
+
+# Define a base URI for your entities (plots, etc.)
+# Replace with your actual desired base URI if possible
+ENTITY_BASE_URI <- "https://your.data.instance.org/entity/"
+```
+
+# 1. Load Data
+```{r}
+# Read all columns as text initially for robustness
+tryCatch({
+  measurements_df <- read_xlsx(EXCEL_FILE, sheet = MEASUREMENTS_SHEET, col_types = "text")
+  metadata_df <- read_xlsx(EXCEL_FILE, sheet = METADATA_SHEET, col_types = "text")
+  ontology_map_df <- read_xlsx(EXCEL_FILE, sheet = ONTOLOGY_MAP_SHEET, col_types = "text")
+
+  # Basic cleaning: remove rows where essential IDs are missing
+  metadata_df <- metadata_df %>% filter(!is.na(entity_id) & entity_id != "")
+  measurements_df <- measurements_df %>% filter(!is.na(entity_id) & entity_id != "")
+  ontology_map_df <- ontology_map_df %>% filter(!is.na(prefix) & prefix != "" & !is.na(uri_base) & uri_base != "")
+
+}, error = function(e) {
+  stop("Error loading data from ", EXCEL_FILE,
+       ".\nCheck file path, sheet names ('", MEASUREMENTS_SHEET, "', '", METADATA_SHEET, "', '", ONTOLOGY_MAP_SHEET,
+       "'), and ensure files are accessible.\nOriginal error: ", e$message)
+})
+```
+
+# 2. Define JSON-LD Context
+```{r}
+# Build context from ontology map
+context_dynamic <- setNames(as.list(ontology_map_df$uri_base), ontology_map_df$prefix)
+
+# Define static context entries for properties and types used
+# Currently common schema.org terms are mapped to simple aliases for cleaner JSON
+context_static <- list(
+  "@base" = ENTITY_BASE_URI, # Base for relative IDs like "@id": "30"
+  "name" = "schema:name",
+  "latitude" = "schema:latitude",
+  "longitude" = "schema:longitude",
+  "author" = list("@id" = "schema:author", "@type" = "@id"),
+  "soilType" = list("@id" = "ex:soilType", "@type" = "@id"),         # Assuming 'ex' prefix needed
+  "fertilizerType" = list("@id" = "ex:fertilizerType", "@type" = "@id"), # Assuming 'ex' prefix needed
+  "observation" = "schema:observation", # Key for the list of measurements
+  "propertyID" = list("@id" = "schema:propertyID", "@type" = "@id"), # Measurement trait ontology
+  "value" = "schema:value",           # Measurement value
+  "unitCode" = "schema:unitCode", # Measurement unit ontology (as CURIE string)
+  "unitText" = "schema:unitText", # Measurement unit text (e.g., "cm")
+  "dateObserved" = list("@id" = "schema:observationDate", "@type" = "xsd:Date") # Measurement date
+  # Add other custom prefixes/terms from your data if needed (e.g., "Custom", "ex")
+  # Ensure prefixes used in data (e.g., "Custom:", "ex:") are defined here or in ontology_map
+  # Example: "Custom": "https://your.custom.vocab.org/"
+  # Example: "ex": "https://your.data.instance.org/terms/" # If needed for properties like ex:soilType
+)
+
+# Combine contexts, static takes precedence
+# Ensure prefixes used (like schema, xsd) are defined only once
+final_context <- c(context_dynamic, context_static[!names(context_static) %in% names(context_dynamic)])
+
+```
+
+# 3. Helper Function for Date Formatting
+```{r}
+format_iso_date <- function(date_str) {
+  if (is.na(date_str) || date_str == "") return(NULL)
+  parsed_date <- NA
+  tryCatch({
+    # Try ISO format first
+    parsed_date <- lubridate::ymd(date_str, quiet = TRUE)
+    # Try common European format
+    if (is.na(parsed_date)) parsed_date <- lubridate::dmy(date_str, quiet = TRUE)
+    # Try common US format
+    if (is.na(parsed_date)) parsed_date <- lubridate::mdy(date_str, quiet = TRUE)
+    # Try Excel numeric date (adjust origin if needed, 1899-12-30 is common Windows default)
+    if (is.na(parsed_date)) {
+      date_num <- suppressWarnings(as.numeric(date_str))
+      if (!is.na(date_num) && date_num > 10000 && date_num < 100000) { # Plausibility check
+        parsed_date <- as.Date(date_num, origin = "1899-12-30")
+      }
+    }
+
+    if (inherits(parsed_date, "Date")) {
+      return(format(parsed_date, "%Y-%m-%d"))
+    } else {
+      warning("Could not parse date: '", date_str, "'.")
+      return(NULL)
+    }
+  }, error = function(e) {
+    warning("Error parsing date '", date_str, "': ", e$message)
+    return(NULL)
+  })
+}
+```
+
+# 4 Build the Graph
+```{r}
+graph_list <- list()
+unique_entity_ids <- unique(metadata_df$entity_id)
+
+cat("Processing entities...\n")
+for (current_id in unique_entity_ids) {
+  cat("  Processing entity:", current_id, "\n")
+
+  # --- 4a. Entity Metadata ---
+  entity_meta_rows <- metadata_df %>% filter(entity_id == current_id)
+
+  if (nrow(entity_meta_rows) == 0) {
+    warning("Skipping entity ", current_id, ": No metadata found.")
+    next
+  }
+
+  # Create the main node for the entity
+  entity_node <- list()
+  entity_node$`@id` <- paste0(current_id) # Relative ID, resolved by @base in context
+  entity_node$`@type` <- entity_meta_rows$entity_type[1] # Use type from first metadata row
+
+  # Loop through metadata attributes for this entity
+  for (i in 1:nrow(entity_meta_rows)) {
+    meta_row <- entity_meta_rows[i, ]
+
+    # Get attribute, value, and type from the row
+    attribute_key <- meta_row$attribute
+    raw_value <- meta_row$value
+    value_type <- meta_row$value_type # Might be NA
+
+    # Skip if essential info is missing
+    if (is.na(attribute_key) || attribute_key == "" || is.na(raw_value) || raw_value == "") next
+
+    # Determine the JSON key (simplified: use alias if exact match, else use full key)
+    # Map common terms to their simple names defined in context_static
+    json_key <- case_when(
+        attribute_key == "schema:name" ~ "name",
+        attribute_key == "schema:latitude" ~ "latitude",
+        attribute_key == "schema:longitude" ~ "longitude",
+        attribute_key == "schema:author" ~ "author",
+        attribute_key == "ex:soilType" ~ "soilType",         # Adjust if needed
+        attribute_key == "ex:fertilizerType" ~ "fertilizerType", # Adjust if needed
+        TRUE ~ attribute_key # Default: use the full attribute name
+    )
+
+    # Process the value based on value_type
+    processed_value <- NULL
+    if (!is.na(value_type) && value_type == "@id") {
+      processed_value <- list(`@id` = raw_value)
+    } else if (!is.na(value_type) && grepl("decimal|integer|double|float", value_type, ignore.case = TRUE)) {
+      processed_value <- suppressWarnings(as.numeric(raw_value))
+      if (is.na(processed_value)) {
+         warning("Could not convert metadata value '", raw_value, "' to numeric for ", attribute_key, " in entity ", current_id)
+         processed_value <- raw_value # Fallback to string
+      }
+    } else {
+      # Default: treat as string (includes xsd:string or missing type)
+      processed_value <- raw_value
+    }
+
+    # Add to node if value is not NA
+    # Handle specific context definitions expecting simplified @id
+     if (!is.na(processed_value)) {
+        context_def <- final_context[[json_key]] # Get definition for the determined key
+        if (!is.null(context_def) && is.list(context_def) && !is.null(context_def$`@type`) && context_def$`@type` == "@id") {
+             # If context expects simple ID string, and we have list('@id'=...), simplify
+             if(is.list(processed_value) && !is.null(processed_value$`@id`)) {
+                 entity_node[[json_key]] <- processed_value$`@id`
+             } else {
+                 entity_node[[json_key]] <- processed_value # Use as is (should be string ID)
+             }
+        } else {
+            # Assign directly (handles strings, numbers, lists for non-@id context)
+             entity_node[[json_key]] <- processed_value
+         }
+     }
+  } # End loop through metadata rows
+
+# 4b. Entity Measurements (Observations)
+
+entity_measurement_rows <- measurements_df %>% filter(entity_id == current_id)
+  observations_list <- list()
+
+  if (nrow(entity_measurement_rows) > 0) {
+    for (j in 1:nrow(entity_measurement_rows)) {
+      meas_row <- entity_measurement_rows[j, ]
+      obs_node <- list()
+
+      # Type (@type)
+      measurement_type <- meas_row$type
+      if (!is.na(measurement_type) && measurement_type != "") {
+        obs_node$`@type` <- measurement_type
+      } else {
+        obs_node$`@type` <- "schema:Observation" # Default if missing
+      }
+
+      # Name (trait_label)
+      trait_label <- meas_row$trait_label
+      if (!is.na(trait_label) && trait_label != "") {
+        obs_node$name <- trait_label
+      }
+
+      # Value (value) - process based on type
+      raw_meas_value <- meas_row$value
+      processed_meas_value <- NA
+      if (!is.na(raw_meas_value)) {
+          # Try converting to number if type suggests it
+          if (grepl("QuantitativeValue", obs_node$`@type`, fixed=TRUE)) {
+              num_val <- suppressWarnings(as.numeric(raw_meas_value))
+              processed_meas_value <- ifelse(is.na(num_val), raw_meas_value, num_val) # Fallback to string if NA
+          } else {
+             processed_meas_value <- raw_meas_value # Keep as string for Text, Comment etc.
+          }
+          if (!is.na(processed_meas_value)) {
+              obs_node$value <- processed_meas_value
+          }
+      }
+
+
+      # Trait Ontology (propertyID)
+      trait_ontology <- meas_row$trait_ontology
+      if (!is.na(trait_ontology) && trait_ontology != "") {
+        obs_node$propertyID <- trait_ontology
+      }
+
+      # Unit Ontology (unitCode)
+      unit_ontology <- meas_row$unit_ontology
+      if (!is.na(unit_ontology) && unit_ontology != "") {
+        obs_node$unitCode <- unit_ontology # Store as CURIE string
+      }
+
+      # Unit Text (unitText)
+      unit_text <- meas_row$unit
+      if (!is.na(unit_text) && unit_text != "") {
+        obs_node$unitText <- unit_text
+      }
+
+      # Date (dateObserved)
+      formatted_date <- format_iso_date(meas_row$date)
+      if (!is.null(formatted_date)) {
+        obs_node$dateObserved <- formatted_date
+      }
+
+      # Add the completed observation node to the list
+      observations_list[[length(observations_list) + 1]] <- obs_node
+
+    } # End loop through measurement rows
+  } # End if measurements exist
+
+  # Add observations list to the main entity node
+  if (length(observations_list) > 0) {
+    entity_node$observation <- observations_list
+  }
+
+  # Add the completed entity node to the graph list
+  graph_list[[length(graph_list) + 1]] <- entity_node
+
+} # End loop through unique entity IDs
+cat("...Processing complete.\n")
+```
+
+# 5. Assemble and Write JSON-LD
+```{r}
+final_jsonld <- list(
+  `@context` = final_context,
+  `@graph` = graph_list
+)
+
+cat("Writing JSON-LD to file:", OUTPUT_JSONLD_FILE, "\n")
+write_json(
+  final_jsonld,
+  OUTPUT_JSONLD_FILE,
+  pretty = TRUE,
+  auto_unbox = TRUE,
+  na = "null" # Represent R NA as JSON null
+)
+
+cat("✅ Success! JSON-LD written to", OUTPUT_JSONLD_FILE, "\n")
+```
+
+
